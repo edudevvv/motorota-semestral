@@ -8,15 +8,115 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
 <link rel="stylesheet" href="/static/style.css">
-
-<!-- Turf.js — distancias geoespaciais no TSP -->
 <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
-
-<!-- javascript-lp-solver — ILP para knapsack e TSP -->
 <script type="module">
   import solver from 'https://cdn.jsdelivr.net/npm/javascript-lp-solver/dist/index.browser.mjs';
   window.LPSolver = solver;
 </script>
+
+<style>
+/* ── ABA NOVO PEDIDO + MAPA UNIFICADA ───────────────────── */
+.pedido-mapa-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto auto;
+  gap: 20px;
+  align-items: start;
+}
+
+/* Coluna esquerda: formulário de endereços + seletor de itens */
+.pedido-col-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Coluna direita: mapa + info cards */
+.pedido-col-mapa {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  position: sticky;
+  top: 72px;            /* abaixo do topbar */
+}
+
+/* Mapa agora dentro da aba unificada — mais alto */
+.mapa-container-pedido {
+  width: 100%;
+  height: 360px;
+  border-radius: 12px;
+  border: 1px solid var(--cinza-claro);
+  overflow: hidden;
+}
+
+/* Faixa de métricas da rota (distância / tempo / preço) */
+.rota-metricas {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+}
+.rota-metrica-box {
+  background: var(--cinza-escuro);
+  border: 1px solid var(--cinza-claro);
+  border-radius: 10px;
+  padding: 12px 14px;
+  text-align: center;
+}
+.rota-metrica-label {
+  font-size: 10px;
+  color: var(--texto-muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+.rota-metrica-valor {
+  font-family: 'Bebas Neue', sans-serif;
+  font-size: 22px;
+  letter-spacing: 1px;
+  color: var(--amarelo);
+}
+
+/* Botões de ação — linha inteira abaixo das duas colunas */
+.pedido-acoes {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* Seção de endereços compacta (dois campos lado a lado) */
+.enderecos-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+/* Card sem padding extra dentro da col-form */
+.card-slim {
+  background: var(--cinza-escuro);
+  border: 1px solid var(--cinza-claro);
+  border-radius: 14px;
+  padding: 18px 20px;
+}
+
+@media (max-width: 1024px) {
+  .pedido-mapa-layout {
+    grid-template-columns: 1fr;
+  }
+  .pedido-col-mapa {
+    position: static;
+  }
+  .pedido-acoes {
+    grid-column: 1;
+  }
+  .enderecos-grid {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 600px) {
+  .rota-metricas { grid-template-columns: 1fr 1fr; }
+}
+</style>
 </head>
 <body>
 
@@ -34,23 +134,22 @@
 
 {% if tipo == 'restaurante' %}
 <!-- ═══════════════════════════════════════════════════════ -->
-<!-- DASHBOARD RESTAURANTE                                   -->
+<!-- PAINEL RESTAURANTE                                      -->
 <!-- ═══════════════════════════════════════════════════════ -->
 <div id="page-restaurante" class="page active">
 
   <div class="hero restaurante-hero">
     <div class="hero-tag">🍽️ PAINEL DO RESTAURANTE</div>
     <h1>Cardapio &<br>Pedidos</h1>
-    <p>Monte o cardapio, crie pedidos, defina enderecos e publique para os motoboys.</p>
+    <p>Monte o cardapio, crie pedidos com visualizacao do mapa em tempo real e publique para os motoboys.</p>
   </div>
 
-  <!-- Sub-abas do restaurante -->
+  <!-- 4 sub-abas: Cardapio · Novo Pedido · Meus Pedidos · Dashboard -->
   <div class="sub-tabs">
-    <button class="sub-tab active" onclick="mudarSubAba('rest', 'cardapio', this)">🍔 Cardapio</button>
-    <button class="sub-tab" onclick="mudarSubAba('rest', 'pedido', this)">🛒 Novo Pedido</button>
-    <button class="sub-tab" onclick="mudarSubAba('rest', 'mapa', this)">🗺️ Mapa</button>
-    <button class="sub-tab" onclick="mudarSubAba('rest', 'publicados', this)">📋 Meus Pedidos</button>
-    <button class="sub-tab" onclick="mudarSubAba('rest', 'dashboard', this)">📊 Dashboard</button>
+    <button class="sub-tab active"  onclick="mudarSubAba('rest','cardapio',this)">🍔 Cardapio</button>
+    <button class="sub-tab"        onclick="mudarSubAba('rest','pedido',this)">🛒 Novo Pedido</button>
+    <button class="sub-tab"        onclick="mudarSubAba('rest','publicados',this)">📋 Meus Pedidos</button>
+    <button class="sub-tab"        onclick="mudarSubAba('rest','dashboard',this)">📊 Dashboard</button>
   </div>
 
   <div class="page-body">
@@ -60,9 +159,11 @@
     <!-- ════════════════════════════════ -->
     <div id="sub-rest-cardapio" class="sub-page active">
       <div class="row row-2col">
+
+        <!-- Formulário de cadastro -->
         <div class="card">
           <div class="card-title">➕ Novo Item do Menu</div>
-          <div class="info-box">ℹ️ Esta secao cadastra itens no menu. Para criar pedidos, use a aba "Novo Pedido".</div>
+          <div class="info-box">ℹ️ Cadastre itens aqui. Para montar e publicar pedidos, use a aba <strong>Novo Pedido</strong>.</div>
           <div class="input-group">
             <label>Nome do item</label>
             <input type="text" id="itemNome" placeholder="Ex: X-Burguer Duplo">
@@ -82,6 +183,7 @@
           <button class="btn btn-primary" style="margin-top:14px;" onclick="adicionarItem()">➕ ADICIONAR AO MENU</button>
         </div>
 
+        <!-- Tabela do menu -->
         <div class="card">
           <div class="card-title">🍔 Menu Cadastrado</div>
           <div class="table-wrap">
@@ -89,89 +191,108 @@
               <thead><tr><th>Item</th><th>Peso</th><th>Volume</th><th>Preco</th><th>Lucro</th><th></th></tr></thead>
               <tbody id="tabelaItens"></tbody>
             </table>
-            <div id="emptyCardapio" class="empty"><div class="empty-icon">🍽️</div>Nenhum item no menu.<br><span style="font-size:12px;">Adicione itens usando o formulario ao lado.</span></div>
+            <div id="emptyCardapio" class="empty">
+              <div class="empty-icon">🍽️</div>
+              Nenhum item no menu.<br>
+              <span style="font-size:12px;">Adicione itens usando o formulario ao lado.</span>
+            </div>
           </div>
         </div>
-      </div>
-    </div>
 
-    <!-- ════════════════════════════════ -->
-    <!-- SUB-ABA: NOVO PEDIDO            -->
-    <!-- ════════════════════════════════ -->
+      </div>
+    </div><!-- /sub-rest-cardapio -->
+
+    <!-- ════════════════════════════════════════════════════ -->
+    <!-- SUB-ABA: NOVO PEDIDO + MAPA (unificados)            -->
+    <!-- ════════════════════════════════════════════════════ -->
     <div id="sub-rest-pedido" class="sub-page">
-      <div class="card">
-        <div class="card-title">🛒 Criar Novo Pedido</div>
-        <div class="info-box">ℹ️ Selecione itens do menu, defina enderecos e publique. Se o pedido exceder a capacidade da bag, ele sera dividido automaticamente.</div>
+      <div class="card" style="padding:22px 24px;">
+        <div class="card-title" style="margin-bottom:18px;">🛒 Criar Novo Pedido</div>
+        <div class="info-box">ℹ️ Preencha enderecos, selecione itens e clique em <strong>Calcular Rota</strong> — o mapa atualiza ao lado. Publique quando estiver pronto.</div>
 
-        <!-- Enderecos -->
-        <div class="row row-2col" style="margin-bottom:20px;">
-          <div>
-            <div class="input-group">
-              <label>🏪 Endereco do Restaurante (Origem)</label>
-              <input type="text" id="endOrigem" placeholder="Ex: Av. Paulista, 1000 — SP">
+        <div class="pedido-mapa-layout" style="margin-top:18px;">
+
+          <!-- ── COLUNA ESQUERDA: formulário ── -->
+          <div class="pedido-col-form">
+
+            <!-- Endereços -->
+            <div class="card-slim">
+              <div style="font-family:'Bebas Neue',sans-serif;font-size:15px;letter-spacing:2px;color:var(--amarelo);margin-bottom:14px;">📍 Enderecos</div>
+              <div class="enderecos-grid">
+                <div>
+                  <div class="input-group" style="margin-bottom:8px;">
+                    <label>🏪 Origem (Restaurante)</label>
+                    <input type="text" id="endOrigem" placeholder="Ex: Av. Paulista, 1000 — SP">
+                  </div>
+                  <button class="btn btn-primary btn-sm" onclick="buscarEndereco('origem')">📍 DEFINIR ORIGEM</button>
+                  <div id="statusOrigem" style="font-size:11px;color:var(--texto-muted);margin-top:6px;min-height:16px;"></div>
+                </div>
+                <div>
+                  <div class="input-group" style="margin-bottom:8px;">
+                    <label>📦 Destino (Cliente)</label>
+                    <input type="text" id="endDestino" placeholder="Ex: Rua das Flores, 200 — SP">
+                  </div>
+                  <button class="btn btn-laranja btn-sm" onclick="buscarEndereco('destino')">📍 DEFINIR DESTINO</button>
+                  <div id="statusDestino" style="font-size:11px;color:var(--texto-muted);margin-top:6px;min-height:16px;"></div>
+                </div>
+              </div>
+
+              <!-- Pontos marcados (compacto) -->
+              <div id="pontosMapa-rest" style="display:flex;flex-direction:column;gap:6px;margin-top:12px;"></div>
             </div>
-            <button class="btn btn-primary btn-sm" onclick="buscarEndereco('origem')">📍 DEFINIR ORIGEM</button>
-            <div id="statusOrigem" style="font-size:12px;color:var(--texto-muted);margin-top:8px;min-height:18px;"></div>
+
+            <!-- Seletor de itens -->
+            <div class="card-slim">
+              <div style="font-family:'Bebas Neue',sans-serif;font-size:15px;letter-spacing:2px;color:var(--amarelo);margin-bottom:12px;">📋 Itens do Pedido</div>
+              <div id="pedidoSelector">
+                <div class="empty" style="padding:20px;font-size:13px;">Cadastre itens no menu primeiro.</div>
+              </div>
+            </div>
+
+            <!-- Resumo calculado via NumPy -->
+            <div id="resumoPedido"></div>
+
+          </div><!-- /pedido-col-form -->
+
+          <!-- ── COLUNA DIREITA: mapa + métricas ── -->
+          <div class="pedido-col-mapa">
+
+            <!-- Métricas da rota -->
+            <div class="rota-metricas">
+              <div class="rota-metrica-box">
+                <div class="rota-metrica-label">📏 Distancia</div>
+                <div class="rota-metrica-valor" id="distanciaRest">— km</div>
+              </div>
+              <div class="rota-metrica-box">
+                <div class="rota-metrica-label">⏱️ Tempo</div>
+                <div class="rota-metrica-valor" id="tempoRest">— min</div>
+              </div>
+              <div class="rota-metrica-box">
+                <div class="rota-metrica-label">💰 Frete</div>
+                <div class="rota-metrica-valor" id="precoRest">R$ —</div>
+                <div style="font-size:9px;color:var(--texto-muted);margin-top:2px;">R$5 + R$2/km · SymPy</div>
+              </div>
+            </div>
+
+            <!-- Mapa -->
+            <div id="map-rest" class="mapa-container-pedido"></div>
+
+            <!-- Botão limpar mapa -->
+            <button class="btn btn-secondary btn-sm" onclick="limparMapa('rest')" style="width:auto;align-self:flex-start;">🗑️ LIMPAR MAPA</button>
+
+          </div><!-- /pedido-col-mapa -->
+
+          <!-- ── LINHA INTEIRA: botões de ação ── -->
+          <div class="pedido-acoes">
+            <button class="btn btn-azul"      style="max-width:220px;" onclick="calcularRota('rest')">🗺️ CALCULAR ROTA</button>
+            <button class="btn btn-verde"     style="max-width:260px;" onclick="sugerirCombinacaoOtima()">⚡ OTIMIZAR COM PuLP</button>
+            <button class="btn btn-laranja"   style="max-width:240px;" onclick="publicarRota()">📢 PUBLICAR PEDIDO</button>
+            <button class="btn btn-secondary" style="max-width:190px;" onclick="limparPedidoAtual()">🗑️ LIMPAR TUDO</button>
           </div>
 
-          <div>
-            <div class="input-group">
-              <label>📦 Endereco do Cliente (Destino)</label>
-              <input type="text" id="endDestino" placeholder="Ex: Rua das Flores, 200 — SP">
-            </div>
-            <button class="btn btn-laranja btn-sm" onclick="buscarEndereco('destino')">📍 DEFINIR DESTINO</button>
-            <div id="statusDestino" style="font-size:12px;color:var(--texto-muted);margin-top:8px;min-height:18px;"></div>
-          </div>
-        </div>
-
-        <!-- Selecao de itens do menu -->
-        <div class="itens-title">📋 Selecione os itens do menu para o pedido</div>
-        <div id="pedidoSelector">
-          <div class="empty" style="padding:20px;"><div style="font-size:13px;">Cadastre itens no menu primeiro.</div></div>
-        </div>
-
-        <!-- Resumo do pedido + acoes -->
-        <div id="resumoPedido" style="margin-top:14px;"></div>
-
-        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:16px;">
-          <button class="btn btn-azul" style="max-width:240px;" onclick="calcularRota('rest')">🗺️ CALCULAR ROTA</button>
-          <button class="btn btn-laranja" style="max-width:280px;" onclick="publicarRota()">📢 PUBLICAR PEDIDO</button>
-          <button class="btn btn-secondary" style="max-width:200px;" onclick="limparPedidoAtual()">🗑️ LIMPAR FORMULARIO</button>
-        </div>
+        </div><!-- /pedido-mapa-layout -->
       </div>
-    </div>
-
-    <!-- ════════════════════════════════ -->
-    <!-- SUB-ABA: MAPA                   -->
-    <!-- ════════════════════════════════ -->
-    <div id="sub-rest-mapa" class="sub-page">
-      <div class="row row-mapa">
-        <div style="display:flex;flex-direction:column;gap:14px;">
-          <div class="card" style="padding:18px 20px;">
-            <div style="font-size:11px;color:var(--texto-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Distancia</div>
-            <div id="distanciaRest" class="dist-info">— km</div>
-          </div>
-          <div class="card" style="padding:18px 20px;">
-            <div style="font-size:11px;color:var(--texto-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">⏱️ Tempo Estimado</div>
-            <div id="tempoRest" class="tempo-info">— min</div>
-          </div>
-          <div class="card" style="padding:18px 20px;">
-            <div style="font-size:11px;color:var(--texto-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">💰 Preco da Entrega</div>
-            <div id="precoRest" class="preco-info">R$ —</div>
-            <div style="font-size:10px;color:var(--texto-muted);margin-top:4px;">Taxa base R$ 5 + R$ 2/km</div>
-          </div>
-          <div class="card">
-            <div class="card-title">📌 Pontos Marcados</div>
-            <div id="pontosMapa-rest" style="display:flex;flex-direction:column;gap:6px;">
-              <div style="font-size:12px;color:var(--texto-muted);">Nenhum ponto definido.</div>
-            </div>
-          </div>
-          <button class="btn btn-secondary" onclick="limparMapa('rest')">🗑️ LIMPAR MAPA</button>
-        </div>
-        <div id="map-rest" class="mapa-container"></div>
-      </div>
-      <div id="resultadoRest" class="resultado"></div>
-    </div>
+    </div><!-- /sub-rest-pedido -->
 
     <!-- ════════════════════════════════ -->
     <!-- SUB-ABA: MEUS PEDIDOS           -->
@@ -191,6 +312,9 @@
     <div id="sub-rest-dashboard" class="sub-page">
       <div class="card">
         <div class="card-title">📊 Resultados do Dia — Restaurante</div>
+        <div class="info-box" style="margin-bottom:16px;font-size:12px;">
+          ⚙️ Métricas calculadas em tempo real via <strong>NumPy</strong> a partir dos pedidos do servidor — atualizadas a cada 3 segundos.
+        </div>
         <div class="stats-grid" id="dashRest">
           <div class="stat-box">
             <div class="stat-label">💰 Lucro Total</div>
@@ -212,16 +336,21 @@
             <div class="stat-value" id="drCustoEntregas">R$ 0,00</div>
             <div class="stat-sub">Valor pago em fretes</div>
           </div>
+          <div class="stat-box">
+            <div class="stat-label">📈 Margem de Lucro</div>
+            <div class="stat-value" id="drMargem" style="color:var(--verde)">0,0%</div>
+            <div class="stat-sub">Lucro / Receita total</div>
+          </div>
         </div>
       </div>
     </div>
 
-  </div>
-</div>
+  </div><!-- /page-body -->
+</div><!-- /page-restaurante -->
 
 {% else %}
 <!-- ═══════════════════════════════════════════════════════ -->
-<!-- DASHBOARD MOTOBOY                                       -->
+<!-- PAINEL MOTOBOY                                          -->
 <!-- ═══════════════════════════════════════════════════════ -->
 <div id="page-motoboy" class="page active">
 
@@ -231,11 +360,10 @@
     <p>Veja rotas publicadas, aceite entregas e confirme quando finalizar. Rotas sao classificadas pela melhor relacao peso/distancia.</p>
   </div>
 
-  <!-- Sub-abas do motoboy -->
   <div class="sub-tabs">
-    <button class="sub-tab active" onclick="mudarSubAba('moto', 'rotas', this)">📋 Rotas</button>
-    <button class="sub-tab" onclick="mudarSubAba('moto', 'mapa', this)">🗺️ Mapa & Navegacao</button>
-    <button class="sub-tab" onclick="mudarSubAba('moto', 'dashboard', this)">📊 Dashboard</button>
+    <button class="sub-tab active" onclick="mudarSubAba('moto','rotas',this)">📋 Rotas</button>
+    <button class="sub-tab"       onclick="mudarSubAba('moto','mapa',this)">🗺️ Mapa &amp; Navegacao</button>
+    <button class="sub-tab"       onclick="mudarSubAba('moto','dashboard',this)">📊 Dashboard</button>
   </div>
 
   <div class="page-body">
@@ -247,16 +375,13 @@
       <div class="card">
         <div class="card-title">📋 Rotas Disponiveis</div>
         <div class="info-box">📦 Capacidade da bag: <strong>84.7 L / 30 kg</strong> · 🏍️ Max <strong>3 pedidos</strong> simultaneos · 🛣️ Rota total ate <strong>20 km</strong></div>
-
-        <!-- Filtro de classificacao -->
         <div class="classificacao-bar">
           <span style="font-size:12px;color:var(--texto-muted);">Classificar por:</span>
-          <button class="class-btn active" onclick="classificarRotas('peso', this)">⚖️ Menor Peso</button>
-          <button class="class-btn" onclick="classificarRotas('valor', this)">💰 Maior Valor</button>
-          <button class="class-btn" onclick="classificarRotas('distancia', this)">🛣️ Menor Distancia</button>
-          <button class="class-btn" onclick="classificarRotas('eficiencia', this)">⚡ Melhor R$/kg</button>
+          <button class="class-btn active" onclick="classificarRotas('peso',this)">⚖️ Menor Peso</button>
+          <button class="class-btn"        onclick="classificarRotas('valor',this)">💰 Maior Valor</button>
+          <button class="class-btn"        onclick="classificarRotas('distancia',this)">🛣️ Menor Distancia</button>
+          <button class="class-btn"        onclick="classificarRotas('eficiencia',this)">⚡ Melhor R$/kg</button>
         </div>
-
         <div id="rotasDisponiveis">
           <div class="empty"><div class="empty-icon">🏪</div>Nenhuma rota publicada ainda.<br><span style="font-size:12px;color:var(--texto-muted);">Aguardando restaurantes.</span></div>
         </div>
@@ -267,7 +392,6 @@
     <!-- SUB-ABA: MAPA & NAVEGACAO       -->
     <!-- ════════════════════════════════ -->
     <div id="sub-moto-mapa" class="sub-page">
-      <!-- Mapa motoboy -->
       <div class="row row-mapa">
         <div style="display:flex;flex-direction:column;gap:14px;">
           <div class="card" style="padding:18px 20px;">
@@ -293,8 +417,7 @@
         <div id="map-moto" class="mapa-container"></div>
       </div>
 
-      <!-- Instrucoes passo a passo -->
-      <div class="instrucoes-card" id="instrucoes-card">
+      <div class="instrucoes-card" id="instrucoes-card" style="margin-top:20px;">
         <div class="instrucoes-header" onclick="toggleInstrucoes()">
           <div class="card-title" style="margin:0;">🧭 Navegacao Passo a Passo</div>
           <div style="display:flex;align-items:center;gap:10px;">
@@ -340,8 +463,8 @@
       </div>
     </div>
 
-  </div>
-</div>
+  </div><!-- /page-body -->
+</div><!-- /page-motoboy -->
 {% endif %}
 
 <!-- ALERTA DE ROTA LONGA -->
@@ -359,7 +482,6 @@
 <!-- TOAST -->
 <div id="toast" class="toast"></div>
 
-<!-- Tipo do usuario para o JS -->
 <script>window.TIPO_USUARIO = '{{ tipo }}';</script>
 <script src="/static/script.js"></script>
 

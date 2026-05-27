@@ -12,11 +12,6 @@ let cardapio = [], pedidoAtual = {}, origem = null, destino = null,
     rotaCache = null, toastTimer = null, instrucoesFechado = false,
     classificacaoAtual = 'peso';
 
-let metricas = {
-  moto: { ganhos: 0, km: 0, entregas: 0 },
-  rest: { lucro: 0, vendas: 0, pedidos: 0, custoEntregas: 0 }
-};
-
 // ── PRODUTOS PRE-CADASTRADOS ─────────────────────────────
 const PRODUTOS_PADRAO = [
   { id: 1, nome: 'X-Burguer',        emoji: '🍔', peso: 0.35, volume: 1.8, preco: 22.00, lucro: 10.00 },
@@ -29,7 +24,6 @@ const PRODUTOS_PADRAO = [
   { id: 8, nome: 'Sushi Combo 20pc', emoji: '🍣', peso: 0.60, volume: 4.0, preco: 55.00, lucro: 25.00 },
 ];
 
-// Carregar cardapio salvo ou usar padrao
 const savedCardapio = localStorage.getItem('motorota_cardapio');
 if (savedCardapio) {
   try { cardapio = JSON.parse(savedCardapio); } catch { cardapio = [...PRODUTOS_PADRAO]; }
@@ -37,19 +31,30 @@ if (savedCardapio) {
   cardapio = [...PRODUTOS_PADRAO];
 }
 
-// Carregar pedidos do servidor (compartilhados entre restaurante e motoboy)
+// ── HELPERS DE API PYTHON ─────────────────────────────────
+async function apiPost(rota, corpo) {
+  const res = await fetch(rota, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(corpo)
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// ── CARREGAMENTO DE PEDIDOS ───────────────────────────────
 async function carregarPedidosDoServidor() {
   try {
     const res = await fetch('/api/pedidos');
     if (res.ok) {
       pedidos = await res.json();
-      renderPedidosPublicados(); renderRotasMotoboy();
+      renderPedidosPublicados();
+      renderRotasMotoboy();
+      await atualizarDashboards();   // recalcula métricas via Python/NumPy
     }
   } catch {}
 }
 carregarPedidosDoServidor();
-
-// Polling: busca pedidos atualizados a cada 3 segundos
 setInterval(carregarPedidosDoServidor, 3000);
 
 function salvarEstado() {
@@ -57,27 +62,43 @@ function salvarEstado() {
 }
 
 // ── MAPAS ─────────────────────────────────────────────────
-let mapRest = null, mapMoto = null;
+let mapRest = null, mapMoto = null, mapRestIniciado = false;
 const TILE = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
 const ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
 const lyr = { rest: {}, moto: { paradas: [] } };
 
-if (TIPO === 'restaurante') {
+// mapRest fica dentro da aba 'pedido' que começa oculta —
+// inicializamos na primeira vez que a aba é aberta (lazy init).
+function iniciarMapRest() {
+  if (mapRestIniciado) { mapRest.invalidateSize(); return; }
+  mapRestIniciado = true;
   mapRest = L.map('map-rest').setView([-23.55, -46.63], 12);
   L.tileLayer(TILE, { attribution: ATTR, maxZoom: 19 }).addTo(mapRest);
   mapRest.on('click', () => toast('Use os campos de texto para definir enderecos', 'info'));
-} else {
+  // Re-aplica marcadores já definidos (se houver)
+  if (origem && mapRest) {
+    lyr.rest.origem = L.marker([origem.lat, origem.lng], { icon: mkIcon('🍽️') }).addTo(mapRest);
+    mapRest.setView([origem.lat, origem.lng], 14);
+  }
+  if (destino && mapRest) {
+    lyr.rest.destino = L.marker([destino.lat, destino.lng], { icon: mkIcon('📍') }).addTo(mapRest);
+  }
+}
+
+if (TIPO === 'motoboy') {
   mapMoto = L.map('map-moto').setView([-23.55, -46.63], 12);
   L.tileLayer(TILE, { attribution: ATTR, maxZoom: 19 }).addTo(mapMoto);
 }
 
 const mkIcon = e => L.divIcon({ html: `<div style="font-size:26px;line-height:1">${e}</div>`, iconSize:[30,30], iconAnchor:[15,28], className:'' });
 
-// ── UTILITARIOS ───────────────────────────────────────────
-const preco  = km => C.TAXA_BASE + km * C.TAXA_KM;
-const tempo  = km => Math.round(km / C.VEL * 60);
-const fmt    = v  => `R$ ${v.toFixed(2).replace('.', ',')}`;
-const distTurf = (a, b) => turf.distance(turf.point([a.lng, a.lat]), turf.point([b.lng, b.lat]), { units: 'kilometers' });
+// ── UTILITÁRIOS LOCAIS (fallback leve) ────────────────────
+// Usados apenas para exibição imediata no front; cálculos reais
+// ficam no Python (NumPy / SymPy / SciPy / PuLP).
+const precoLocal  = km => C.TAXA_BASE + km * C.TAXA_KM;
+const tempoLocal  = km => Math.round(km / C.VEL * 60);
+const fmt         = v  => `R$ ${v.toFixed(2).replace('.', ',')}`;
+const distTurf    = (a, b) => turf.distance(turf.point([a.lng, a.lat]), turf.point([b.lng, b.lat]), { units: 'kilometers' });
 
 function toast(msg, tipo = 'ok') {
   const t = document.getElementById('toast');
@@ -97,20 +118,18 @@ function rmLayer(modo, key) {
 function infoEntrega(modo, km) {
   const pfx = modo === 'rest' ? 'Rest' : 'Moto';
   if (km == null || isNaN(km)) {
-    const el1 = document.getElementById('distancia'+pfx);
-    const el2 = document.getElementById('tempo'+pfx);
-    const el3 = document.getElementById('preco'+pfx);
-    if (el1) el1.textContent = '— km';
-    if (el2) el2.textContent = '— min';
-    if (el3) el3.textContent = 'R$ —';
+    ['distancia','tempo','preco'].forEach(id => {
+      const el = document.getElementById(id+pfx);
+      if (el) el.textContent = id==='preco' ? 'R$ —' : `— ${id==='distancia'?'km':'min'}`;
+    });
     return;
   }
   const el1 = document.getElementById('distancia'+pfx);
   const el2 = document.getElementById('tempo'+pfx);
   const el3 = document.getElementById('preco'+pfx);
   if (el1) el1.textContent = `${km.toFixed(2)} km`;
-  if (el2) el2.textContent = `${tempo(km)} min`;
-  if (el3) el3.textContent = `R$ ${preco(km).toFixed(2)}`;
+  if (el2) el2.textContent = `${tempoLocal(km)} min`;
+  if (el3) el3.textContent = `R$ ${precoLocal(km).toFixed(2)}`;
 }
 
 // ── SUB-ABAS ─────────────────────────────────────────────
@@ -120,14 +139,17 @@ function mudarSubAba(painel, aba, btn) {
   document.getElementById(prefix + aba).classList.add('active');
   btn.parentElement.querySelectorAll('.sub-tab').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
-  // Invalidar mapa ao trocar para aba de mapa
-  setTimeout(() => {
-    if (mapRest) mapRest.invalidateSize();
-    if (mapMoto) mapMoto.invalidateSize();
-  }, 80);
+  // Mapa do restaurante: lazy-init + invalidate ao entrar na aba 'pedido'
+  if (painel === 'rest' && aba === 'pedido') {
+    setTimeout(() => iniciarMapRest(), 80);
+  }
+  // Mapa do motoboy: invalidate ao entrar na aba 'mapa'
+  if (painel === 'moto' && aba === 'mapa') {
+    setTimeout(() => { if (mapMoto) mapMoto.invalidateSize(); }, 80);
+  }
 }
 
-// ── ENDERECO ──────────────────────────────────────────────
+// ── ENDEREÇO ──────────────────────────────────────────────
 async function buscarEndereco(tipo) {
   const isOrig  = tipo === 'origem';
   const inputEl = document.getElementById(isOrig ? 'endOrigem' : 'endDestino');
@@ -149,6 +171,7 @@ async function buscarEndereco(tipo) {
 
     const pt = { lat: +res.lat, lng: +res.lon, nome: val };
     const [emoji, pop] = isOrig ? ['🍽️','Restaurante'] : ['📍','Cliente'];
+    iniciarMapRest();
     rmLayer('rest', isOrig ? 'origem' : 'destino');
     if (mapRest) {
       lyr.rest[isOrig ? 'origem' : 'destino'] = L.marker([pt.lat, pt.lng], { icon: mkIcon(emoji) }).bindPopup(`${emoji} ${pop}: ${val}`).addTo(mapRest);
@@ -186,6 +209,7 @@ async function calcularRota(modo) {
   const o = modo === 'rest' ? origem : pedidos.find(p => p.id === pedidoSelecionadoId)?.origem;
   const d = modo === 'rest' ? destino : pedidos.find(p => p.id === pedidoSelecionadoId)?.destino;
   if (!o || !d) { toast('Defina origem e destino primeiro!', 'erro'); return; }
+  if (modo === 'rest') iniciarMapRest();
   try {
     const { distKm, coords } = await ghRoute([o, d]);
     const mapAlvo = modo === 'rest' ? mapRest : mapMoto;
@@ -195,7 +219,14 @@ async function calcularRota(modo) {
     mapAlvo.fitBounds(lyr[modo].rota.getBounds(), { padding:[28,28] });
     if (modo === 'rest') distAtualKm = distKm;
     infoEntrega(modo, distKm);
-    toast(`Rota: ${distKm.toFixed(2)} km · ${tempo(distKm)} min · R$ ${preco(distKm).toFixed(2)}`);
+
+    // Usa SymPy/Python para calcular preço e tempo
+    try {
+      const calc = await apiPost('/api/calcular/preco', { km: distKm });
+      toast(`Rota: ${distKm.toFixed(2)} km · ${calc.tempo_min} min · R$ ${calc.preco.toFixed(2)}`);
+    } catch {
+      toast(`Rota: ${distKm.toFixed(2)} km · ${tempoLocal(distKm)} min · R$ ${precoLocal(distKm).toFixed(2)}`);
+    }
   } catch (e) { toast('Erro ao calcular rota: ' + e.message, 'erro'); }
 }
 
@@ -216,14 +247,8 @@ function limparMapa(modo) {
   if (modo === 'moto') { lyr.moto.paradas.forEach(m => mapMoto.removeLayer(m)); lyr.moto.paradas = []; }
   if (modo === 'rest') {
     origem = destino = null; distAtualKm = null;
-    const el1 = document.getElementById('endOrigem');
-    const el2 = document.getElementById('endDestino');
-    if (el1) el1.value = '';
-    if (el2) el2.value = '';
-    const s1 = document.getElementById('statusOrigem');
-    const s2 = document.getElementById('statusDestino');
-    if (s1) s1.textContent = '';
-    if (s2) s2.textContent = '';
+    ['endOrigem','endDestino'].forEach(id => { const e=document.getElementById(id); if(e) e.value=''; });
+    ['statusOrigem','statusDestino'].forEach(id => { const e=document.getElementById(id); if(e) e.textContent=''; });
   } else { pedidoSelecionadoId = null; rotaCache = null; renderInstrucoes(); }
   infoEntrega(modo, null);
   modo === 'moto' ? atualizarParadasMotoboy() : atualizarPontos(modo);
@@ -286,158 +311,142 @@ function ajustarQtd(itemId, delta) {
   renderSelector(); renderResumoPedido();
 }
 
-// Somas do pedido atual
 const somaItens = prop => Object.entries(pedidoAtual).reduce((s,[id,q]) => s + (cardapio.find(i=>i.id===+id)?.[prop]||0)*q, 0);
 const totalItens = () => Object.values(pedidoAtual).reduce((a,b)=>a+b,0);
 
-function renderResumoPedido() {
+// ── RESUMO PEDIDO (usa NumPy via Python) ──────────────────
+async function renderResumoPedido() {
   const el = document.getElementById('resumoPedido');
   if (!el) return;
   const tot = totalItens();
   if (!tot) { el.innerHTML = ''; return; }
-  const [vol, peso, venda, lucro_] = ['volume','peso','preco','lucro'].map(somaItens);
-  const pctVol = (vol / C.VOL_BAG * 100).toFixed(1);
-  const pctPeso = (peso / C.PESO_BAG * 100).toFixed(1);
-  const excedeBag = vol > C.VOL_BAG || peso > C.PESO_BAG;
+
+  const itensPayload = Object.entries(pedidoAtual).map(([id, qtd]) => {
+    const it = cardapio.find(i => i.id === +id);
+    return { ...it, qtd };
+  });
+
+  let resumo;
+  try {
+    resumo = await apiPost('/api/calcular/resumo-pedido', { itens: itensPayload });
+  } catch {
+    // fallback local
+    const vol   = somaItens('volume'), peso = somaItens('peso');
+    const venda = somaItens('preco'),  lucro_ = somaItens('lucro');
+    resumo = {
+      total_itens: tot, peso_total: peso, volume_total: vol,
+      venda_total: venda, lucro_total: lucro_,
+      pct_vol: +(vol / C.VOL_BAG * 100).toFixed(1),
+      pct_peso: +(peso / C.PESO_BAG * 100).toFixed(1),
+      excede_bag: vol > C.VOL_BAG || peso > C.PESO_BAG,
+      n_divisoes: Math.ceil(Math.max(vol/C.VOL_BAG, peso/C.PESO_BAG))
+    };
+  }
+
+  const { total_itens, peso_total, volume_total, venda_total, lucro_total,
+          pct_vol, pct_peso, excede_bag, n_divisoes } = resumo;
+
   el.innerHTML = `
     <div class="resultado" style="display:block;margin-top:14px;">
-      <div class="resultado-header"><span style="font-size:22px">🛒</span><h2 style="font-size:20px;">Resumo do Pedido</h2></div>
-      ${excedeBag ? `<div class="info-box" style="border-color:var(--amarelo);color:var(--amarelo);background:rgba(255,214,0,0.08);margin-bottom:14px;">⚠️ Pedido excede a capacidade da bag! Sera dividido automaticamente em ${Math.ceil(Math.max(vol/C.VOL_BAG, peso/C.PESO_BAG))} entregas ao publicar.</div>` : ''}
+      <div class="resultado-header"><span style="font-size:22px">🛒</span><h2 style="font-size:20px;">Resumo do Pedido</h2><span style="font-size:11px;color:var(--texto-muted);margin-left:8px;">calculado com NumPy</span></div>
+      ${excede_bag ? `<div class="info-box" style="border-color:var(--amarelo);color:var(--amarelo);background:rgba(255,214,0,0.08);margin-bottom:14px;">⚠️ Pedido excede a capacidade da bag! Sera dividido automaticamente em ${n_divisoes} entregas ao publicar.</div>` : ''}
       <div class="stats-grid">
-        <div class="stat-box"><div class="stat-label">Itens</div><div class="stat-value">${tot}</div></div>
-        <div class="stat-box"><div class="stat-label">Total Venda</div><div class="stat-value">R$ ${venda.toFixed(2)}</div></div>
-        <div class="stat-box"><div class="stat-label">Lucro</div><div class="stat-value" style="color:var(--verde)">R$ ${lucro_.toFixed(2)}</div></div>
-        <div class="stat-box"><div class="stat-label">Peso</div><div class="stat-value" style="${peso > C.PESO_BAG ? 'color:var(--vermelho)' : ''}">${peso.toFixed(2)}<span style="font-size:12px"> kg</span></div></div>
-        <div class="stat-box"><div class="stat-label">Volume</div><div class="stat-value" style="${vol > C.VOL_BAG ? 'color:var(--vermelho)' : ''}">${vol.toFixed(2)}<span style="font-size:12px"> L</span></div><div class="stat-sub">${pctVol}% de ${C.VOL_BAG} L</div></div>
+        <div class="stat-box"><div class="stat-label">Itens</div><div class="stat-value">${total_itens}</div></div>
+        <div class="stat-box"><div class="stat-label">Total Venda</div><div class="stat-value">R$ ${venda_total.toFixed(2)}</div></div>
+        <div class="stat-box"><div class="stat-label">Lucro</div><div class="stat-value" style="color:var(--verde)">R$ ${lucro_total.toFixed(2)}</div></div>
+        <div class="stat-box"><div class="stat-label">Peso</div><div class="stat-value" style="${peso_total > C.PESO_BAG ? 'color:var(--vermelho)' : ''}">${peso_total.toFixed(2)}<span style="font-size:12px"> kg</span></div></div>
+        <div class="stat-box"><div class="stat-label">Volume</div><div class="stat-value" style="${volume_total > C.VOL_BAG ? 'color:var(--vermelho)' : ''}">${volume_total.toFixed(2)}<span style="font-size:12px"> L</span></div><div class="stat-sub">${pct_vol}% de ${C.VOL_BAG} L</div></div>
       </div>
-      <div class="progress-label"><span>📦 Volume da Bag</span><span>${vol.toFixed(2)} / ${C.VOL_BAG} L</span></div>
-      <div class="progress-bar"><div class="progress-fill fill-vol" style="width:${Math.min(100,pctVol)}%"></div></div>
-      <div class="progress-label"><span>⚖️ Peso da Bag</span><span>${peso.toFixed(2)} / ${C.PESO_BAG} kg</span></div>
-      <div class="progress-bar"><div class="progress-fill fill-peso" style="width:${Math.min(100,pctPeso)}%"></div></div>
+      <div class="progress-label"><span>📦 Volume da Bag</span><span>${volume_total.toFixed(2)} / ${C.VOL_BAG} L</span></div>
+      <div class="progress-bar"><div class="progress-fill fill-vol" style="width:${Math.min(100,pct_vol)}%"></div></div>
+      <div class="progress-label"><span>⚖️ Peso da Bag</span><span>${peso_total.toFixed(2)} / ${C.PESO_BAG} kg</span></div>
+      <div class="progress-bar"><div class="progress-fill fill-peso" style="width:${Math.min(100,pct_peso)}%"></div></div>
     </div>`;
 }
 
 function limparPedidoAtual() {
   pedidoAtual = {}; origem = destino = null; distAtualKm = null;
-  const el1 = document.getElementById('endOrigem');
-  const el2 = document.getElementById('endDestino');
-  if (el1) el1.value = '';
-  if (el2) el2.value = '';
-  const s1 = document.getElementById('statusOrigem');
-  const s2 = document.getElementById('statusDestino');
-  if (s1) s1.textContent = '';
-  if (s2) s2.textContent = '';
+  ['endOrigem','endDestino'].forEach(id => { const e=document.getElementById(id); if(e) e.value=''; });
+  ['statusOrigem','statusDestino'].forEach(id => { const e=document.getElementById(id); if(e) e.textContent=''; });
   ['origem','destino','rota'].forEach(k => rmLayer('rest', k));
   infoEntrega('rest', null); atualizarPontos('rest');
   renderSelector(); renderResumoPedido(); toast('Formulario limpo');
 }
 
-// ── KNAPSACK ILP ──────────────────────────────────────────
-function otimizarBag(qtdMax = 10) {
-  if (!window.LPSolver || !cardapio.length) return null;
-  const vars = {}, constraints = { volume: { max: C.VOL_BAG }, peso: { max: C.PESO_BAG } }, ints = {};
-  cardapio.forEach(it => {
-    const v = `i${it.id}`;
-    vars[v] = { lucro: it.lucro, volume: it.volume, peso: it.peso, [`lim${it.id}`]: 1 };
-    constraints[`lim${it.id}`] = { max: qtdMax };
-    ints[v] = 1;
-  });
-  const res = window.LPSolver.Solve({ optimize:'lucro', opType:'max', constraints, variables:vars, ints });
-  if (!res.feasible) return null;
-  return cardapio.flatMap(it => {
-    const q = Math.round(res[`i${it.id}`] || 0);
-    return q > 0 ? [{ ...it, qtd: q }] : [];
-  });
-}
-
-function sugerirCombinacaoOtima() {
+// ── OTIMIZAR BAG — PuLP via Python ────────────────────────
+async function sugerirCombinacaoOtima() {
   if (!cardapio.length) { toast('Cadastre itens no menu primeiro!', 'erro'); return; }
-  toast('Calculando combinacao otima...', 'info');
-  setTimeout(() => {
-    const itens = otimizarBag();
-    if (!itens?.length) { toast('Nenhuma combinacao viavel.', 'erro'); return; }
-    pedidoAtual = Object.fromEntries(itens.map(it => [it.id, it.qtd]));
-    renderSelector(); renderResumoPedido();
-    const [lucro_, vol, peso] = ['lucro','volume','peso'].map(somaItens);
+  toast('Calculando combinacao otima com PuLP (ILP)...', 'info');
+  try {
+    const resp = await apiPost('/api/calcular/otimizar-bag', { cardapio, qtd_max: 10 });
+    if (!resp.itens?.length) { toast('Nenhuma combinacao viavel.', 'erro'); return; }
+    pedidoAtual = Object.fromEntries(resp.itens.map(it => [it.id, it.qtd]));
+    renderSelector();
+    await renderResumoPedido();
+    const lucro_ = somaItens('lucro'), vol = somaItens('volume'), peso = somaItens('peso');
     toast(`Otimo: Lucro R$ ${lucro_.toFixed(2)} · ${vol.toFixed(1)} L · ${peso.toFixed(1)} kg`);
-  }, 50);
+  } catch (e) {
+    toast('Erro na otimizacao: ' + e.message, 'erro');
+  }
 }
 
-// ── DIVISAO DE PEDIDOS ────────────────────────────────────
-// Quando o pedido excede a capacidade da bag (volume ou peso),
-// divide automaticamente em multiplos pedidos menores
-function dividirPedido(itensCompletos, origemP, destinoP, distKm) {
-  const pedidosDivididos = [];
-  let itensRestantes = itensCompletos.map(it => ({ ...it })); // clone
+// ── DIVISÃO DE PEDIDOS — NumPy via Python ─────────────────
+async function dividirPedidoPython(itensCompletos, distKm) {
+  try {
+    const resp = await apiPost('/api/calcular/dividir-pedido', {
+      itens: itensCompletos, dist_km: distKm
+    });
+    return resp.pedidos || [];
+  } catch {
+    // fallback JS
+    return dividirPedidoLocal(itensCompletos, distKm);
+  }
+}
 
+function dividirPedidoLocal(itensCompletos, distKm) {
+  const pedidosDivididos = [];
+  let itensRestantes = itensCompletos.map(it => ({ ...it }));
   while (itensRestantes.length > 0) {
     const pedidoAtualDiv = [];
     let pesoAcum = 0, volAcum = 0;
-
     for (let i = itensRestantes.length - 1; i >= 0; i--) {
-      const it = itensRestantes[i];
-      let qtdCabe = 0;
-
+      const it = itensRestantes[i]; let qtdCabe = 0;
       for (let q = 1; q <= it.qtd; q++) {
-        const novoPeso = pesoAcum + it.peso * q;
-        const novoVol = volAcum + it.volume * q;
-        if (novoPeso <= C.PESO_BAG && novoVol <= C.VOL_BAG) {
-          qtdCabe = q;
-        } else {
-          break;
-        }
+        if (pesoAcum + it.peso * q <= C.PESO_BAG && volAcum + it.volume * q <= C.VOL_BAG) qtdCabe = q;
+        else break;
       }
-
       if (qtdCabe > 0) {
         pedidoAtualDiv.push({ ...it, qtd: qtdCabe });
-        pesoAcum += it.peso * qtdCabe;
-        volAcum += it.volume * qtdCabe;
-
-        if (qtdCabe >= it.qtd) {
-          itensRestantes.splice(i, 1);
-        } else {
-          itensRestantes[i].qtd -= qtdCabe;
-        }
+        pesoAcum += it.peso * qtdCabe; volAcum += it.volume * qtdCabe;
+        if (qtdCabe >= it.qtd) itensRestantes.splice(i, 1);
+        else itensRestantes[i].qtd -= qtdCabe;
       }
     }
-
-    // Se nao conseguiu colocar nada (item unico > bag), forca 1 unidade
     if (pedidoAtualDiv.length === 0 && itensRestantes.length > 0) {
       const it = itensRestantes.shift();
       pedidoAtualDiv.push({ ...it, qtd: 1 });
-      if (it.qtd > 1) {
-        itensRestantes.unshift({ ...it, qtd: it.qtd - 1 });
-      }
+      if (it.qtd > 1) itensRestantes.unshift({ ...it, qtd: it.qtd - 1 });
     }
-
     if (pedidoAtualDiv.length > 0) {
-      const pesoTotal = pedidoAtualDiv.reduce((s, it) => s + it.peso * it.qtd, 0);
-      const volumeTotal = pedidoAtualDiv.reduce((s, it) => s + it.volume * it.qtd, 0);
-      const vendaTotal = pedidoAtualDiv.reduce((s, it) => s + it.preco * it.qtd, 0);
-      const lucroTotal = pedidoAtualDiv.reduce((s, it) => s + it.lucro * it.qtd, 0);
-
       pedidosDivididos.push({
-        id: Date.now() + pedidosDivididos.length,
-        origem: { ...origemP },
-        destino: { ...destinoP },
         itens: pedidoAtualDiv,
-        distKm, tempoMin: tempo(distKm), precoEntrega: preco(distKm),
-        pesoTotal, volumeTotal, vendaTotal, lucroTotal,
-        status: 'aguardando',
-        criadoEm: new Date().toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit' })
+        pesoTotal:    pedidoAtualDiv.reduce((s,i)=>s+i.peso*i.qtd,0),
+        volumeTotal:  pedidoAtualDiv.reduce((s,i)=>s+i.volume*i.qtd,0),
+        vendaTotal:   pedidoAtualDiv.reduce((s,i)=>s+i.preco*i.qtd,0),
+        lucroTotal:   pedidoAtualDiv.reduce((s,i)=>s+i.lucro*i.qtd,0),
+        distKm, tempoMin: tempoLocal(distKm), precoEntrega: precoLocal(distKm), status: 'aguardando',
+        criadoEm: new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})
       });
     }
   }
-
   return pedidosDivididos;
 }
 
-// ── PUBLICAR PEDIDO ───────────────────────────────────────
+// ── API DE PEDIDOS ────────────────────────────────────────
 async function enviarPedidosServidor(novosPedidos) {
   try {
     await fetch('/api/pedidos', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(novosPedidos)
     });
   } catch { toast('Erro ao enviar pedido ao servidor', 'erro'); }
@@ -446,48 +455,50 @@ async function enviarPedidosServidor(novosPedidos) {
 async function atualizarPedidoServidor(id, dados) {
   try {
     await fetch(`/api/pedidos/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(dados)
     });
   } catch {}
 }
 
 async function publicarRota() {
-  if (!origem || !destino)         { toast('Defina origem e destino!', 'erro'); return; }
-  if (!totalItens())               { toast('Selecione itens!', 'erro'); return; }
-  if (distAtualKm == null)         { toast('Calcule a rota antes de publicar!', 'erro'); return; }
+  if (!origem || !destino)  { toast('Defina origem e destino!', 'erro'); return; }
+  if (!totalItens())        { toast('Selecione itens!', 'erro'); return; }
+  if (distAtualKm == null)  { toast('Calcule a rota antes de publicar!', 'erro'); return; }
 
   const itensCompletos = Object.entries(pedidoAtual).map(([id,qtd]) => ({ ...cardapio.find(i=>i.id===+id), qtd }));
-  const pesoTotal = itensCompletos.reduce((s, it) => s + it.peso * it.qtd, 0);
-  const volumeTotal = itensCompletos.reduce((s, it) => s + it.volume * it.qtd, 0);
+  const pesoTotal  = itensCompletos.reduce((s,it)=>s+it.peso*it.qtd,0);
+  const volumeTotal = itensCompletos.reduce((s,it)=>s+it.volume*it.qtd,0);
 
-  // Verificar se precisa dividir
   if (volumeTotal > C.VOL_BAG || pesoTotal > C.PESO_BAG) {
-    const divididos = dividirPedido(itensCompletos, origem, destino, distAtualKm);
-    pedidos.push(...divididos);
-    await enviarPedidosServidor(divididos);
+    toast('Dividindo pedido com NumPy...', 'info');
+    const divididos = await dividirPedidoPython(itensCompletos, distAtualKm);
+    const com_ids = divididos.map((p, i) => ({
+      ...p, id: Date.now() + i, origem: {...origem}, destino: {...destino},
+      criadoEm: new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})
+    }));
+    pedidos.push(...com_ids);
+    await enviarPedidosServidor(com_ids);
     limparPedidoAtual(); renderPedidosPublicados(); renderRotasMotoboy();
     salvarEstado();
-    toast(`Pedido dividido em ${divididos.length} entregas (excedia a bag)!`, 'alerta');
+    toast(`Pedido dividido em ${com_ids.length} entregas (NumPy bin-packing)!`, 'alerta');
     return;
   }
 
   const novoPedido = {
     id: Date.now(), origem: {...origem}, destino: {...destino},
     itens: itensCompletos,
-    distKm: distAtualKm, tempoMin: tempo(distAtualKm), precoEntrega: preco(distAtualKm),
+    distKm: distAtualKm, tempoMin: tempoLocal(distAtualKm), precoEntrega: precoLocal(distAtualKm),
     pesoTotal, volumeTotal,
-    vendaTotal: itensCompletos.reduce((s, it) => s + it.preco * it.qtd, 0),
-    lucroTotal: itensCompletos.reduce((s, it) => s + it.lucro * it.qtd, 0),
+    vendaTotal: itensCompletos.reduce((s,it)=>s+it.preco*it.qtd,0),
+    lucroTotal: itensCompletos.reduce((s,it)=>s+it.lucro*it.qtd,0),
     status: 'aguardando',
-    criadoEm: new Date().toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit' })
+    criadoEm: new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})
   };
   pedidos.push(novoPedido);
   await enviarPedidosServidor([novoPedido]);
   limparPedidoAtual(); renderPedidosPublicados(); renderRotasMotoboy();
-  salvarEstado();
-  toast('Pedido publicado!');
+  salvarEstado(); toast('Pedido publicado!');
 }
 
 // ── CARDS DE STATUS ───────────────────────────────────────
@@ -537,7 +548,7 @@ async function cancelarPedido(id) {
   toast('Pedido cancelado', 'info');
 }
 
-// ── CLASSIFICACAO DE ROTAS (MOTOBOY) ──────────────────────
+// ── CLASSIFICAÇÃO DE ROTAS (MOTOBOY) ─────────────────────
 function classificarRotas(tipo, btn) {
   classificacaoAtual = tipo;
   if (btn) {
@@ -550,33 +561,23 @@ function classificarRotas(tipo, btn) {
 function ordenarPedidosParaMotoboy(lista) {
   const copia = [...lista];
   switch (classificacaoAtual) {
-    case 'peso':
-      // Menor peso primeiro = mais facil de carregar
-      return copia.sort((a, b) => a.pesoTotal - b.pesoTotal);
-    case 'valor':
-      // Maior valor primeiro = mais lucrativo
-      return copia.sort((a, b) => b.precoEntrega - a.precoEntrega);
-    case 'distancia':
-      // Menor distancia primeiro
-      return copia.sort((a, b) => a.distKm - b.distKm);
-    case 'eficiencia':
-      // Melhor relacao R$/kg (valor por kg transportado)
-      return copia.sort((a, b) => {
-        const efA = a.pesoTotal > 0 ? a.precoEntrega / a.pesoTotal : 0;
-        const efB = b.pesoTotal > 0 ? b.precoEntrega / b.pesoTotal : 0;
-        return efB - efA;
-      });
-    default:
-      return copia;
+    case 'peso':     return copia.sort((a,b) => a.pesoTotal - b.pesoTotal);
+    case 'valor':    return copia.sort((a,b) => b.precoEntrega - a.precoEntrega);
+    case 'distancia':return copia.sort((a,b) => a.distKm - b.distKm);
+    case 'eficiencia':return copia.sort((a,b) => {
+      const efA = a.pesoTotal>0 ? a.precoEntrega/a.pesoTotal : 0;
+      const efB = b.pesoTotal>0 ? b.precoEntrega/b.pesoTotal : 0;
+      return efB - efA;
+    });
+    default: return copia;
   }
 }
 
-// ── ALERTA DE ROTA LONGA ──────────────────────────────────
 function mostrarAlertaRota(distKm) {
   const alerta = document.getElementById('alertaRota');
-  const msg = document.getElementById('alertaRotaMsg');
+  const msg    = document.getElementById('alertaRotaMsg');
   if (!alerta || !msg) return;
-  msg.textContent = `A rota tem ${distKm.toFixed(2)} km, excedendo o limite de ${C.MAX_KM} km. Considere aceitar menos pedidos.`;
+  msg.textContent = `A rota tem ${distKm.toFixed(2)} km, excedendo o limite de ${C.MAX_KM} km.`;
   alerta.classList.add('show');
   setTimeout(() => alerta.classList.remove('show'), 8000);
 }
@@ -595,17 +596,11 @@ function renderRotasMotoboy() {
   const aceitos  = pedidos.filter(p => p.status==='aceito');
   const noLimite = aceitos.length >= C.MAX_PED;
   const dist = rotaCache?.distKm ?? 0, tmp = rotaCache?.tempoMin ?? 0;
-  const pesoAceito = aceitos.reduce((s, p) => s + p.pesoTotal, 0);
-
-  // Classificar pedidos disponiveis
+  const pesoAceito = aceitos.reduce((s,p) => s + p.pesoTotal, 0);
   const pedidosOrdenados = ordenarPedidosParaMotoboy(pedidos);
-
-  // Calcular metrica de classificacao label
   const classLabels = {
-    peso: '⚖️ Ordenado por menor peso',
-    valor: '💰 Ordenado por maior valor',
-    distancia: '🛣️ Ordenado por menor distancia',
-    eficiencia: '⚡ Ordenado por melhor R$/kg'
+    peso: '⚖️ Ordenado por menor peso', valor: '💰 Ordenado por maior valor',
+    distancia: '🛣️ Ordenado por menor distancia', eficiencia: '⚡ Ordenado por melhor R$/kg'
   };
 
   el.innerHTML = `
@@ -615,20 +610,17 @@ function renderRotasMotoboy() {
     </div>
     ${aceitos.length ? `
     <div class="progress-label"><span>⚖️ Peso na Bag</span><span>${pesoAceito.toFixed(2)} / ${C.PESO_BAG} kg</span></div>
-    <div class="progress-bar"><div class="progress-fill fill-peso" style="width:${Math.min(100, pesoAceito/C.PESO_BAG*100)}%"></div></div>
+    <div class="progress-bar"><div class="progress-fill fill-peso" style="width:${Math.min(100,pesoAceito/C.PESO_BAG*100)}%"></div></div>
     <div class="progress-label"><span>🛣️ Distancia da Rota</span><span>${dist.toFixed(2)} / ${C.MAX_KM} km</span></div>
-    <div class="progress-bar"><div class="progress-fill fill-vol" style="width:${Math.min(100, dist/C.MAX_KM*100)}%"></div></div>
+    <div class="progress-bar"><div class="progress-fill fill-vol" style="width:${Math.min(100,dist/C.MAX_KM*100)}%"></div></div>
     ` : ''}
     <div style="font-size:11px;color:var(--texto-muted);margin:10px 0 6px;text-transform:uppercase;letter-spacing:1px;">${classLabels[classificacaoAtual]}</div>` +
     pedidosOrdenados.map(p => {
       const s = STATUS[p.status];
       const itensHTML = p.itens.map(it => `<span class="badge">${it.emoji} ${it.nome} ×${it.qtd}</span>`).join(' ');
       const eficiencia = p.pesoTotal > 0 ? (p.precoEntrega / p.pesoTotal).toFixed(2) : '0.00';
-
-      // Alertas visuais
       const distAlerta = p.distKm > C.MAX_KM ? `<div class="alerta-inline">⚠️ Rota longa: ${p.distKm.toFixed(2)} km (limite: ${C.MAX_KM} km)</div>` : '';
       const pesoAlerta = p.pesoTotal > C.PESO_BAG ? `<div class="alerta-inline">⚠️ Peso alto: ${p.pesoTotal.toFixed(2)} kg</div>` : '';
-
       const acoes = p.status==='aguardando'
         ? (noLimite ? `<button class="btn btn-secondary btn-sm" disabled style="opacity:0.4;cursor:not-allowed">🚫 LIMITE ATINGIDO</button>` : `<button class="btn btn-verde btn-sm" onclick="aceitarRota(${p.id})">✅ ACEITAR</button>`)
         : p.status==='aceito' ? `<button class="btn btn-azul btn-sm" onclick="verRotaMapa(${p.id})">🗺️ VER NO MAPA</button><button class="btn btn-verde btn-sm" onclick="confirmarEntrega(${p.id})">📦 CONFIRMAR ENTREGA</button>` : '';
@@ -656,65 +648,24 @@ function renderRotasMotoboy() {
     }).join('');
 }
 
-// ── TSP-MTZ ILP ───────────────────────────────────────────
-function tspMTZ(paradas) {
-  if (!window.LPSolver || paradas.length <= 2) return paradas;
-  const n = paradas.length, vars = {}, constraints = {}, ints = {};
-
-  for (let i=0; i<n; i++) for (let j=0; j<n; j++) {
-    if (i===j) continue;
-    vars[`x${i}_${j}`] = { d: distTurf(paradas[i], paradas[j]) };
-    ints[`x${i}_${j}`] = 1;
+// ── TSP — SciPy nearest-neighbor via Python ───────────────
+async function tspPython(paradas) {
+  if (paradas.length <= 2) return paradas;
+  try {
+    const resp = await apiPost('/api/calcular/tsp', { paradas });
+    return resp.paradas || paradas;
+  } catch {
+    return paradas; // fallback: ordem original
   }
-  for (let i=1; i<n; i++) {
-    vars[`u${i}`] = { d:0, [`umin${i}`]:1, [`umax${i}`]:1 };
-    constraints[`umin${i}`] = { min:1 };
-    constraints[`umax${i}`] = { max: n-1 };
-  }
-
-  for (let i=0; i<n; i++) {
-    constraints[`out${i}`] = { equal:1 };
-    constraints[`in${i}`]  = { equal:1 };
-    for (let j=0; j<n; j++) {
-      if (i===j) continue;
-      vars[`x${i}_${j}`][`out${i}`] = 1;
-      vars[`x${i}_${j}`][`in${j}`]  = 1;
-    }
-  }
-
-  for (let i=1; i<n; i++) for (let j=1; j<n; j++) {
-    if (i===j) continue;
-    constraints[`mtz${i}_${j}`] = { max: n-1 };
-    vars[`u${i}`][`mtz${i}_${j}`]     = 1;
-    vars[`u${j}`][`mtz${i}_${j}`]     = -1;
-    vars[`x${i}_${j}`][`mtz${i}_${j}`] = n;
-  }
-
-  [...new Set(paradas.map(p=>p.pedidoId))].forEach(pid => {
-    const pi = paradas.findIndex(p=>p.pedidoId===pid && p.tipo==='pickup');
-    const di = paradas.findIndex(p=>p.pedidoId===pid && p.tipo==='dropoff');
-    if (pi<1 || di<1) return;
-    constraints[`prec${pid}`] = { max:-1 };
-    vars[`u${pi}`][`prec${pid}`]  = 1;
-    vars[`u${di}`][`prec${pid}`]  = -1;
-  });
-
-  const res = window.LPSolver.Solve({ optimize:'d', opType:'min', constraints, variables:vars, ints });
-  if (!res.feasible) return paradas;
-
-  const next = {};
-  for (let i=0; i<n; i++) for (let j=0; j<n; j++) {
-    if (i!==j && Math.round(res[`x${i}_${j}`]||0)===1) next[i]=j;
-  }
-  const ordem = [0];
-  for (let k=1; k<n; k++) { const nx=next[ordem.at(-1)]; if(nx==null)break; ordem.push(nx); }
-  return ordem.map(i=>paradas[i]);
 }
 
 async function calcularRotaCombinada(pedidosAceitos) {
   const pickups  = pedidosAceitos.map(p=>({ tipo:'pickup',  pedidoId:p.id, lat:p.origem.lat,  lng:p.origem.lng,  nome:p.origem.nome  }));
   const dropoffs = pedidosAceitos.map(p=>({ tipo:'dropoff', pedidoId:p.id, lat:p.destino.lat, lng:p.destino.lng, nome:p.destino.nome }));
-  const paradas  = tspMTZ([...pickups, ...dropoffs]);
+
+  // SciPy nearest-neighbor via Python
+  const paradas = await tspPython([...pickups, ...dropoffs]);
+
   const { distKm, coords, instrucoes } = await ghRoute(paradas);
 
   const segs = []; let cur = [], idx = 0;
@@ -724,33 +675,26 @@ async function calcularRotaCombinada(pedidosAceitos) {
   }
   if (cur.length) segs.push({ pedidoId:paradas[idx]?.pedidoId, tipo:paradas[idx]?.tipo, steps:cur });
 
-  return { ids:pedidosAceitos.map(p=>p.id), paradas, coords, distKm, tempoMin:tempo(distKm), instrucoes:segs };
+  return { ids:pedidosAceitos.map(p=>p.id), paradas, coords, distKm, tempoMin:tempoLocal(distKm), instrucoes:segs };
 }
 
-// ── ACOES MOTOBOY ─────────────────────────────────────────
+// ── AÇÕES MOTOBOY ─────────────────────────────────────────
 async function aceitarRota(id) {
   const p = pedidos.find(x=>x.id===id);
   if (!p || p.status!=='aguardando') return;
   const aceitos = pedidos.filter(x=>x.status==='aceito');
   if (aceitos.length >= C.MAX_PED) { toast(`Limite de ${C.MAX_PED} pedidos atingido`, 'erro'); return; }
 
-  // Verificar peso na bag
-  const pesoAtual = aceitos.reduce((s, x) => s + x.pesoTotal, 0);
+  const pesoAtual = aceitos.reduce((s,x)=>s+x.pesoTotal,0);
   if (pesoAtual + p.pesoTotal > C.PESO_BAG) {
     toast(`Peso excederia a bag! Atual: ${pesoAtual.toFixed(1)}kg + ${p.pesoTotal.toFixed(1)}kg > ${C.PESO_BAG}kg`, 'erro');
     return;
   }
 
-  toast('Calculando rota otima...', 'info');
+  toast('Calculando rota otima com SciPy...', 'info');
   try {
     const sim = await calcularRotaCombinada([...aceitos, p]);
-
-    // Alerta se rota > 20km (mas permite aceitar)
-    if (sim.distKm > C.MAX_KM) {
-      mostrarAlertaRota(sim.distKm);
-      toast(`⚠️ Rota tem ${sim.distKm.toFixed(2)} km (acima de ${C.MAX_KM} km)!`, 'alerta');
-    }
-
+    if (sim.distKm > C.MAX_KM) { mostrarAlertaRota(sim.distKm); toast(`⚠️ Rota tem ${sim.distKm.toFixed(2)} km (acima de ${C.MAX_KM} km)!`, 'alerta'); }
     p.status = 'aceito'; rotaCache = sim; pedidoSelecionadoId = id;
     await atualizarPedidoServidor(id, { status: 'aceito' });
     renderPedidosPublicados(); renderRotasMotoboy(); desenharRota(); salvarEstado();
@@ -765,11 +709,9 @@ async function verRotaMapa(id) {
   try {
     rotaCache = await calcularRotaCombinada(lista);
     desenharRota();
-    // Trocar para aba de mapa
     const btn = document.querySelectorAll('#page-motoboy .sub-tab')[1];
     if (btn) mudarSubAba('moto', 'mapa', btn);
-  }
-  catch { toast('Erro ao recalcular rota', 'erro'); }
+  } catch { toast('Erro ao recalcular rota', 'erro'); }
 }
 
 async function confirmarEntrega(id) {
@@ -778,10 +720,7 @@ async function confirmarEntrega(id) {
   p.status = 'entregue';
   p.entregueEm = new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
   await atualizarPedidoServidor(id, { status: 'entregue', entregueEm: p.entregueEm });
-  metricas.moto.ganhos += p.precoEntrega; metricas.moto.km += p.distKm; metricas.moto.entregas++;
-  metricas.rest.lucro  += p.lucroTotal;   metricas.rest.vendas += p.vendaTotal;
-  metricas.rest.pedidos++; metricas.rest.custoEntregas += p.precoEntrega;
-  atualizarDashboards();
+  await atualizarDashboards();
   await _recalcularOuLimpar();
   renderPedidosPublicados(); renderRotasMotoboy(); salvarEstado();
   toast(`Entrega confirmada! +R$ ${p.precoEntrega.toFixed(2)}`);
@@ -834,11 +773,27 @@ function atualizarParadasMotoboy() {
     </div>`).join('');
 }
 
-// ── DASHBOARDS ────────────────────────────────────────────
-function atualizarDashboards() {
-  const m = metricas, media = m.moto.entregas ? m.moto.ganhos/m.moto.entregas : 0;
+// ── DASHBOARDS — recalcula via NumPy/Python ───────────────
+// FIX: as métricas são sempre derivadas dos pedidos do servidor,
+// nunca de estado local, resolvendo o bug de "métricas zeradas".
+async function atualizarDashboards() {
+  let m;
+  try {
+    m = await apiPost('/api/calcular/metricas', { pedidos });
+  } catch {
+    // fallback local
+    const entregues = pedidos.filter(p=>p.status==='entregue');
+    const ganhos = entregues.reduce((s,p)=>s+p.precoEntrega,0);
+    const kms    = entregues.reduce((s,p)=>s+p.distKm,0);
+    m = {
+      moto: { ganhos, km: kms, entregas: entregues.length, media: entregues.length ? ganhos/entregues.length : 0 },
+      rest: { lucro: entregues.reduce((s,p)=>s+p.lucroTotal,0), vendas: entregues.reduce((s,p)=>s+p.vendaTotal,0),
+              pedidos: entregues.length, custoEntregas: ganhos, margemPct: 0 },
+      historico: entregues.map(p=>({ id:p.id, origemNome:p.origem?.nome||'', entregueEm:p.entregueEm||'', distKm:p.distKm, precoEntrega:p.precoEntrega, lucroTotal:p.lucroTotal }))
+    };
+  }
 
-  // Dashboard motoboy
+  // ── Dashboard motoboy ──
   const dmG = document.getElementById('dmGanhos');
   const dmK = document.getElementById('dmKm');
   const dmE = document.getElementById('dmEntregas');
@@ -846,36 +801,41 @@ function atualizarDashboards() {
   if (dmG) dmG.textContent = fmt(m.moto.ganhos);
   if (dmK) dmK.textContent = `${m.moto.km.toFixed(1)} km`;
   if (dmE) dmE.textContent = m.moto.entregas;
-  if (dmM) dmM.textContent = fmt(media);
+  if (dmM) dmM.textContent = fmt(m.moto.media);
 
   const dmHist = document.getElementById('dmHistorico');
-  if (dmHist) {
-    const entregues = pedidos.filter(p=>p.status==='entregue');
-    dmHist.innerHTML = entregues.length ? `
+  if (dmHist && m.historico?.length) {
+    dmHist.innerHTML = `
       <div style="font-size:11px;color:var(--texto-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Historico de entregas</div>
-      ${entregues.map(p=>`
+      ${m.historico.map(p=>`
         <div class="item-row">
           <div class="item-row-left">
             <span style="font-family:'Bebas Neue',sans-serif;font-size:14px;color:var(--amarelo)">#${p.id.toString().slice(-4)}</span>
-            <div style="font-size:12px"><div>${p.origem.nome.slice(0,30)}${p.origem.nome.length>30?'…':''}</div>
-            <div style="color:var(--texto-muted)">${p.entregueEm||''} · ${p.distKm.toFixed(2)} km</div></div>
+            <div style="font-size:12px">
+              <div>${(p.origemNome||'').slice(0,30)}${(p.origemNome||'').length>30?'…':''}</div>
+              <div style="color:var(--texto-muted)">${p.entregueEm} · ${p.distKm.toFixed(2)} km</div>
+            </div>
           </div>
           <div class="item-row-right"><span class="lucro-chip">+${fmt(p.precoEntrega)}</span></div>
-        </div>`).join('')}` : '';
+        </div>`).join('')}`;
+  } else if (dmHist) {
+    dmHist.innerHTML = '';
   }
 
-  // Dashboard restaurante
+  // ── Dashboard restaurante ──
   const drL = document.getElementById('drLucro');
   const drV = document.getElementById('drVendas');
   const drP = document.getElementById('drPedidos');
   const drC = document.getElementById('drCustoEntregas');
+  const drM = document.getElementById('drMargem');   // novo elemento opcional
   if (drL) drL.textContent = fmt(m.rest.lucro);
   if (drV) drV.textContent = fmt(m.rest.vendas);
   if (drP) drP.textContent = m.rest.pedidos;
   if (drC) drC.textContent = fmt(m.rest.custoEntregas);
+  if (drM) drM.textContent = `${m.rest.margemPct.toFixed(1)}%`;
 }
 
-// ── INSTRUCOES ────────────────────────────────────────────
+// ── INSTRUÇÕES ────────────────────────────────────────────
 function toggleInstrucoes() {
   instrucoesFechado = !instrucoesFechado;
   const body = document.getElementById('instrucoes-body');
@@ -885,7 +845,7 @@ function toggleInstrucoes() {
 }
 
 function renderInstrucoes() {
-  const body = document.getElementById('instrucoes-body');
+  const body   = document.getElementById('instrucoes-body');
   const resumo = document.getElementById('instrucoes-resumo');
   if (!body || !resumo) return;
   if (!rotaCache?.instrucoes?.length) {
